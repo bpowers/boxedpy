@@ -1,0 +1,33 @@
+(version 1)
+
+; Base Seatbelt policy for sandboxed command execution.
+;
+; Security model: Deny by default, then explicitly allow necessary operations.
+; File access restricted to explicitly mounted paths.
+
+(deny default)
+
+; Import basic BSD system calls which provides:
+; - file-read-metadata (traverse symlinks)
+; - signal (target self)
+; - sysctl-read
+; - file-map-executable for system libraries
+; - access to standard /dev files
+; - mach-lookup for specific system services
+(import "/System/Library/Sandbox/Profiles/bsd.sb")
+
+; Essential process operations (not provided by bsd.sb)
+(allow process-exec)
+(allow process-fork)
+(allow process-info*)
+
+; Signal to same sandbox (bsd.sb only provides signal to self)
+(allow signal (target same-sandbox))
+
+; IPC operations (broader than what system.sb provides)
+(allow mach-lookup)        ; All services (system.sb restricts to specific services)
+(allow ipc-posix-shm)      ; All shared memory (system.sb restricts to specific names)
+(allow ipc-posix-sem)      ; Semaphores (not in system.sb)
+(allow file-ioctl)         ; All ioctl (system.sb only for dtracehelper)
+
+; File read/write access to mounted paths added dynamically by exec_darwin.go
