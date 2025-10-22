@@ -1,11 +1,14 @@
 package sandbox
 
 import (
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -120,6 +123,110 @@ func TestNetworkProxy_HTTPConnect(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Contains(t, string(body), "test response")
+}
+
+func TestNetworkProxy_SOCKS5(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// Only test on macOS for now (TCP sockets are easier to test)
+	if runtime.GOOS != "darwin" {
+		t.Skip("TCP proxy test only runs on macOS")
+	}
+
+	t.Parallel()
+
+	// Create a test HTTP server
+	testServer := &testHTTPServer{}
+	testServer.Start(t)
+	defer testServer.Stop()
+
+	// Extract target host and port
+	targetURL, err := url.Parse(testServer.URL)
+	require.NoError(t, err)
+	targetHost := targetURL.Hostname()
+	targetPort := targetURL.Port()
+
+	// Create proxy with no filter (allow all)
+	proxy, err := NewNetworkProxy(nil)
+	require.NoError(t, err)
+	defer proxy.Close()
+
+	// Extract SOCKS proxy address (should be 127.0.0.1:PORT on macOS)
+	socksAddr := proxy.SOCKSAddr()
+	require.True(t, strings.Contains(socksAddr, "127.0.0.1:"))
+
+	// Connect to SOCKS5 proxy
+	socksConn, err := net.Dial("tcp", socksAddr)
+	require.NoError(t, err)
+	defer socksConn.Close()
+
+	// Perform SOCKS5 handshake
+	// Send: [version, nmethods, methods]
+	_, err = socksConn.Write([]byte{0x05, 0x01, 0x00}) // version 5, 1 method, no auth
+	require.NoError(t, err)
+
+	// Read: [version, method]
+	reply := make([]byte, 2)
+	_, err = io.ReadFull(socksConn, reply)
+	require.NoError(t, err)
+	assert.Equal(t, byte(0x05), reply[0]) // version 5
+	assert.Equal(t, byte(0x00), reply[1]) // no auth accepted
+
+	// Send SOCKS5 request: CONNECT to test server
+	// [version, cmd, reserved, atyp, dst.addr, dst.port]
+	request := []byte{
+		0x05, // version
+		0x01, // cmd: CONNECT
+		0x00, // reserved
+		0x03, // atyp: domain name
+	}
+	request = append(request, byte(len(targetHost))) // domain length
+	request = append(request, []byte(targetHost)...) // domain
+	portNum, _ := strconv.Atoi(targetPort)           // port number
+	request = append(request, byte(portNum>>8))      // port high byte
+	request = append(request, byte(portNum&0xff))    // port low byte
+
+	_, err = socksConn.Write(request)
+	require.NoError(t, err)
+
+	// Read SOCKS5 reply
+	replyHeader := make([]byte, 4)
+	_, err = io.ReadFull(socksConn, replyHeader)
+	require.NoError(t, err)
+	assert.Equal(t, byte(0x05), replyHeader[0]) // version 5
+	assert.Equal(t, byte(0x00), replyHeader[1]) // success
+
+	// Read bind address (we don't care about it, but need to consume it)
+	atyp := replyHeader[3]
+	switch atyp {
+	case 0x01: // IPv4
+		bindAddr := make([]byte, 4+2) // 4 bytes IP + 2 bytes port
+		io.ReadFull(socksConn, bindAddr)
+	case 0x03: // Domain
+		lenBuf := make([]byte, 1)
+		io.ReadFull(socksConn, lenBuf)
+		bindAddr := make([]byte, int(lenBuf[0])+2) // domain + port
+		io.ReadFull(socksConn, bindAddr)
+	case 0x04: // IPv6
+		bindAddr := make([]byte, 16+2) // 16 bytes IP + 2 bytes port
+		io.ReadFull(socksConn, bindAddr)
+	}
+
+	// Now the connection is established, send HTTP request
+	httpRequest := fmt.Sprintf("GET /test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHost)
+	_, err = socksConn.Write([]byte(httpRequest))
+	require.NoError(t, err)
+
+	// Read HTTP response
+	response, err := io.ReadAll(socksConn)
+	require.NoError(t, err)
+
+	// Verify we got a valid HTTP response
+	responseStr := string(response)
+	assert.Contains(t, responseStr, "HTTP/1.1 200 OK")
+	assert.Contains(t, responseStr, "test response")
 }
 
 // Test helpers

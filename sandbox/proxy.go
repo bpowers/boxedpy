@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -81,8 +82,8 @@ func NewNetworkProxy(filter *NetworkFilter) (*NetworkProxy, error) {
 	}
 
 	// Get listener addresses
-	p.httpAddr = formatAddress(httpLn.Addr())
-	p.socksAddr = formatAddress(socksLn.Addr())
+	p.httpAddr = formatHTTPAddress(httpLn.Addr())
+	p.socksAddr = formatSOCKSAddress(socksLn.Addr())
 
 	// Start HTTP proxy server
 	p.wg.Add(1)
@@ -392,8 +393,170 @@ func (p *NetworkProxy) isAllowed(host, port string) bool {
 // handleSOCKS processes a SOCKS5 connection.
 func (p *NetworkProxy) handleSOCKS(clientConn net.Conn) error {
 	defer clientConn.Close()
-	// Placeholder - will be implemented in Phase 3
+
+	// SOCKS5 handshake
+	if err := socks5Handshake(clientConn); err != nil {
+		return fmt.Errorf("socks5 handshake: %w", err)
+	}
+
+	// Read SOCKS5 request
+	host, port, err := socks5ReadRequest(clientConn)
+	if err != nil {
+		socks5SendReply(clientConn, 0x01) // General failure
+		return fmt.Errorf("socks5 read request: %w", err)
+	}
+
+	// Check filter
+	if !p.isAllowed(host, port) {
+		socks5SendReply(clientConn, 0x02) // Connection not allowed
+		return fmt.Errorf("socks5: destination %s:%s not allowed", host, port)
+	}
+
+	// Dial target
+	targetAddr := net.JoinHostPort(host, port)
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		socks5SendReply(clientConn, 0x05) // Connection refused
+		return fmt.Errorf("socks5 dial %s: %w", targetAddr, err)
+	}
+	defer targetConn.Close()
+
+	// Send success reply
+	if err := socks5SendReply(clientConn, 0x00); err != nil {
+		return fmt.Errorf("socks5 send reply: %w", err)
+	}
+
+	// Start bidirectional copy
+	bidirectionalCopy(targetConn, clientConn)
 	return nil
+}
+
+// socks5Handshake performs the SOCKS5 handshake (authentication negotiation).
+// We only support "no authentication" (method 0x00).
+func socks5Handshake(conn net.Conn) error {
+	// Read client greeting: [version, nmethods, methods...]
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return fmt.Errorf("read version and nmethods: %w", err)
+	}
+
+	version := buf[0]
+	nmethods := buf[1]
+
+	if version != 0x05 {
+		return fmt.Errorf("unsupported SOCKS version: %d", version)
+	}
+
+	// Read authentication methods
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return fmt.Errorf("read methods: %w", err)
+	}
+
+	// Check if "no authentication" (0x00) is supported
+	noAuthSupported := false
+	for _, method := range methods {
+		if method == 0x00 {
+			noAuthSupported = true
+			break
+		}
+	}
+
+	if !noAuthSupported {
+		// No acceptable methods
+		conn.Write([]byte{0x05, 0xFF})
+		return fmt.Errorf("no acceptable authentication methods")
+	}
+
+	// Send server choice: [version, method]
+	_, err := conn.Write([]byte{0x05, 0x00}) // version 5, no auth
+	return err
+}
+
+// socks5ReadRequest reads the SOCKS5 request and extracts the destination host and port.
+// Returns (host, port, error).
+func socks5ReadRequest(conn net.Conn) (string, string, error) {
+	// Read fixed part: [version, cmd, reserved, atyp]
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return "", "", fmt.Errorf("read request header: %w", err)
+	}
+
+	version := buf[0]
+	cmd := buf[1]
+	atyp := buf[3]
+
+	if version != 0x05 {
+		return "", "", fmt.Errorf("unsupported SOCKS version: %d", version)
+	}
+
+	if cmd != 0x01 { // Only support CONNECT
+		return "", "", fmt.Errorf("unsupported command: %d", cmd)
+	}
+
+	var host string
+	var err error
+
+	// Read destination address based on address type
+	switch atyp {
+	case 0x01: // IPv4
+		ipBytes := make([]byte, 4)
+		if _, err := io.ReadFull(conn, ipBytes); err != nil {
+			return "", "", fmt.Errorf("read IPv4 address: %w", err)
+		}
+		host = net.IP(ipBytes).String()
+
+	case 0x03: // Domain name
+		// Read domain length
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return "", "", fmt.Errorf("read domain length: %w", err)
+		}
+		domainLen := lenBuf[0]
+
+		// Read domain
+		domainBytes := make([]byte, domainLen)
+		if _, err := io.ReadFull(conn, domainBytes); err != nil {
+			return "", "", fmt.Errorf("read domain: %w", err)
+		}
+		host = string(domainBytes)
+
+	case 0x04: // IPv6
+		ipBytes := make([]byte, 16)
+		if _, err := io.ReadFull(conn, ipBytes); err != nil {
+			return "", "", fmt.Errorf("read IPv6 address: %w", err)
+		}
+		host = net.IP(ipBytes).String()
+
+	default:
+		return "", "", fmt.Errorf("unsupported address type: %d", atyp)
+	}
+
+	// Read port (2 bytes, big endian)
+	portBytes := make([]byte, 2)
+	if _, err = io.ReadFull(conn, portBytes); err != nil {
+		return "", "", fmt.Errorf("read port: %w", err)
+	}
+	port := binary.BigEndian.Uint16(portBytes)
+
+	return host, fmt.Sprintf("%d", port), nil
+}
+
+// socks5SendReply sends a SOCKS5 reply to the client.
+// rep is the reply code: 0x00 (success), 0x01 (general failure), 0x02 (not allowed), etc.
+func socks5SendReply(conn net.Conn, rep byte) error {
+	// Build reply: [version, rep, reserved, atyp, bnd.addr, bnd.port]
+	// We use a dummy bind address: 0.0.0.0:0
+	reply := []byte{
+		0x05,       // version
+		rep,        // reply code
+		0x00,       // reserved
+		0x01,       // atyp: IPv4
+		0, 0, 0, 0, // bind address: 0.0.0.0
+		0, 0, // bind port: 0
+	}
+	_, err := conn.Write(reply)
+	return err
 }
 
 // Platform-specific listener creation
@@ -455,12 +618,26 @@ func createTCPListeners() (httpLn, socksLn net.Listener, tmpDir string, err erro
 	return httpLn, socksLn, "", nil
 }
 
-// formatAddress converts a net.Addr to the appropriate proxy URL format.
-func formatAddress(addr net.Addr) string {
+// formatHTTPAddress converts a net.Addr to the appropriate HTTP proxy URL format.
+func formatHTTPAddress(addr net.Addr) string {
 	switch a := addr.(type) {
 	case *net.TCPAddr:
 		// TCP address on macOS: "http://127.0.0.1:PORT"
 		return fmt.Sprintf("http://%s", a.String())
+	case *net.UnixAddr:
+		// Unix socket on Linux: "unix:///path/to/socket"
+		return fmt.Sprintf("unix://%s", a.Name)
+	default:
+		return addr.String()
+	}
+}
+
+// formatSOCKSAddress converts a net.Addr to the appropriate SOCKS proxy address format.
+func formatSOCKSAddress(addr net.Addr) string {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		// TCP address on macOS: "127.0.0.1:PORT"
+		return a.String()
 	case *net.UnixAddr:
 		// Unix socket on Linux: "unix:///path/to/socket"
 		return fmt.Sprintf("unix://%s", a.Name)
