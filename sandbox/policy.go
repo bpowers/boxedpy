@@ -83,6 +83,26 @@ type Policy struct {
 	// (full network access is granted).
 	AllowLocalhostOnly bool
 
+	// NetworkProxy enables filtered network access through HTTP and SOCKS5 proxies.
+	// When set, the sandboxed process can only access network destinations allowed by
+	// the proxy's filter. The proxy runs in the parent process and intercepts all
+	// network connections.
+	//
+	// - macOS: Seatbelt restricts network access to only the proxy ports
+	// - Linux: Full network namespace isolation (--unshare-net) with Unix socket mounting
+	//
+	// The proxy must be explicitly created and closed by the caller:
+	//   proxy, err := NewNetworkProxy(filter)
+	//   if err != nil { return err }
+	//   defer proxy.Close()
+	//   policy.NetworkProxy = proxy
+	//
+	// Environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) are automatically
+	// set in the sandboxed process to use the proxy.
+	//
+	// Note: If NetworkProxy is set, AllowNetwork and AllowLocalhostOnly are ignored.
+	NetworkProxy *NetworkProxy
+
 	// The following fields are Linux-specific and ignored on macOS:
 
 	// AllowSharedNamespaces, when true, disables namespace isolation (skips --unshare-all).

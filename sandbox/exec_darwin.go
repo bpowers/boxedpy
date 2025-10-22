@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	_ "embed"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -55,6 +56,11 @@ func (p *Policy) commandContext(ctx context.Context, name string, arg ...string)
 		runtime.SetFinalizer(cmd, func(c *exec.Cmd) {
 			os.RemoveAll(tmpDir)
 		})
+	}
+
+	// If network proxy is configured, add proxy environment variables
+	if p.NetworkProxy != nil {
+		cmd.Env = append(cmd.Env, p.NetworkProxy.Env()...)
 	}
 
 	return cmd, nil
@@ -184,7 +190,18 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 	}
 
 	// Add network access rules based on policy
-	if policy.AllowNetwork {
+	if policy.NetworkProxy != nil {
+		// Proxy-based network filtering
+		// Extract ports from proxy addresses
+		httpPort := extractPort(policy.NetworkProxy.HTTPAddr())
+		socksPort := extractPort(policy.NetworkProxy.SOCKSAddr())
+
+		// Allow network access ONLY to proxy ports on localhost
+		policyBuilder.WriteString("(allow network-outbound\n")
+		policyBuilder.WriteString(fmt.Sprintf("  (remote ip \"localhost:%s\"))\n", httpPort))
+		policyBuilder.WriteString("(allow network-outbound\n")
+		policyBuilder.WriteString(fmt.Sprintf("  (remote ip \"localhost:%s\"))\n", socksPort))
+	} else if policy.AllowNetwork {
 		// Full network access (includes localhost and internet)
 		policyBuilder.WriteString("(allow network-outbound)\n")
 		policyBuilder.WriteString("(allow network-inbound)\n")
@@ -198,7 +215,7 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 		policyBuilder.WriteString("(allow network-inbound\n")
 		policyBuilder.WriteString("  (local ip \"localhost:*\"))\n")
 	}
-	// If both are false, no network rules are added (network is blocked)
+	// If all are false/nil, no network rules are added (network is blocked)
 
 	fullPolicy = policyBuilder.String()
 
@@ -235,4 +252,21 @@ func randomString(n int) string {
 		b[i] = letters[int(b[i])%len(letters)]
 	}
 	return string(b)
+}
+
+// extractPort extracts the port number from a proxy address string.
+// For HTTP addresses like "http://127.0.0.1:PORT", returns "PORT".
+// For other addresses like "127.0.0.1:PORT", returns "PORT".
+func extractPort(addr string) string {
+	// Strip http:// prefix if present
+	if idx := strings.Index(addr, "://"); idx >= 0 {
+		addr = addr[idx+3:]
+	}
+
+	// Extract port from host:port
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
 }
