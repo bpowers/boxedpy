@@ -229,6 +229,122 @@ func TestNetworkProxy_SOCKS5(t *testing.T) {
 	assert.Contains(t, responseStr, "test response")
 }
 
+func TestNetworkFilter_Wildcards(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		pattern string
+		host    string
+		port    string
+		want    bool
+	}{
+		// Exact matches
+		{"exact match", "example.com", "example.com", "80", true},
+		{"exact match different port", "example.com", "example.com", "443", true},
+		{"exact no match", "example.com", "other.com", "80", false},
+
+		// Wildcard matches
+		{"wildcard matches subdomain", "*.example.com", "api.example.com", "80", true},
+		{"wildcard matches nested subdomain", "*.example.com", "foo.bar.example.com", "80", true},
+		{"wildcard does not match base", "*.example.com", "example.com", "80", false},
+		{"wildcard does not match different domain", "*.example.com", "example.org", "80", false},
+
+		// Port-specific patterns
+		{"port match", "example.com:443", "example.com", "443", true},
+		{"port no match", "example.com:443", "example.com", "80", false},
+		{"wildcard with port match", "*.example.com:443", "api.example.com", "443", true},
+		{"wildcard with port no match", "*.example.com:443", "api.example.com", "80", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchesPattern(tt.pattern, tt.host, tt.port)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestNetworkFilter_AllowList(t *testing.T) {
+	t.Parallel()
+
+	filter := &NetworkFilter{
+		AllowHosts: []string{"github.com", "*.npmjs.org"},
+	}
+
+	proxy := &NetworkProxy{filter: filter}
+
+	// Should allow github.com
+	assert.True(t, proxy.isAllowed("github.com", "443"))
+
+	// Should allow npmjs.org subdomains
+	assert.True(t, proxy.isAllowed("registry.npmjs.org", "443"))
+
+	// Should NOT allow npmjs.org itself
+	assert.False(t, proxy.isAllowed("npmjs.org", "443"))
+
+	// Should NOT allow other domains
+	assert.False(t, proxy.isAllowed("evil.com", "80"))
+}
+
+func TestNetworkFilter_DenyList(t *testing.T) {
+	t.Parallel()
+
+	filter := &NetworkFilter{
+		DenyHosts: []string{"evil.com", "*.malware.org"},
+	}
+
+	proxy := &NetworkProxy{filter: filter}
+
+	// Should deny evil.com
+	assert.False(t, proxy.isAllowed("evil.com", "80"))
+
+	// Should deny malware.org subdomains
+	assert.False(t, proxy.isAllowed("download.malware.org", "80"))
+
+	// Should allow everything else (no allow list)
+	assert.True(t, proxy.isAllowed("github.com", "443"))
+	assert.True(t, proxy.isAllowed("example.com", "80"))
+}
+
+func TestNetworkFilter_DenyPrecedence(t *testing.T) {
+	t.Parallel()
+
+	filter := &NetworkFilter{
+		AllowHosts: []string{"*.example.com"},
+		DenyHosts:  []string{"bad.example.com"},
+	}
+
+	proxy := &NetworkProxy{filter: filter}
+
+	// Should allow other subdomains
+	assert.True(t, proxy.isAllowed("api.example.com", "80"))
+
+	// Should deny bad.example.com (deny wins)
+	assert.False(t, proxy.isAllowed("bad.example.com", "80"))
+}
+
+func TestNetworkFilter_PortMatching(t *testing.T) {
+	t.Parallel()
+
+	filter := &NetworkFilter{
+		AllowHosts: []string{"example.com:443", "api.example.com"},
+	}
+
+	proxy := &NetworkProxy{filter: filter}
+
+	// Should allow example.com:443
+	assert.True(t, proxy.isAllowed("example.com", "443"))
+
+	// Should NOT allow example.com:80
+	assert.False(t, proxy.isAllowed("example.com", "80"))
+
+	// Should allow api.example.com on any port
+	assert.True(t, proxy.isAllowed("api.example.com", "80"))
+	assert.True(t, proxy.isAllowed("api.example.com", "443"))
+	assert.True(t, proxy.isAllowed("api.example.com", "8080"))
+}
+
 // Test helpers
 
 // testHTTPServer is a simple HTTP server for testing proxy functionality.

@@ -380,14 +380,97 @@ func (p *NetworkProxy) isAllowed(host, port string) bool {
 		return true
 	}
 
-	// Placeholder - full implementation in Phase 4
-	// For now, allow everything if filter is set but empty
-	if len(p.filter.AllowHosts) == 0 && len(p.filter.DenyHosts) == 0 {
+	// Check deny list first (deny takes precedence)
+	for _, pattern := range p.filter.DenyHosts {
+		if matchesPattern(pattern, host, port) {
+			return false
+		}
+	}
+
+	// If allow list is empty, allow everything (unless already denied above)
+	if len(p.filter.AllowHosts) == 0 {
 		return true
 	}
 
-	// Temporary: allow all if filter exists (will be properly implemented in Phase 4)
-	return true
+	// Check allow list - must match at least one pattern
+	for _, pattern := range p.filter.AllowHosts {
+		if matchesPattern(pattern, host, port) {
+			return true
+		}
+	}
+
+	// Allow list exists but no match found
+	return false
+}
+
+// matchesPattern checks if a host:port matches a given pattern.
+// Patterns support wildcards and optional port specifications:
+//   - "example.com" matches "example.com" with any port
+//   - "example.com:443" matches "example.com" only with port 443
+//   - "*.example.com" matches "api.example.com" but NOT "example.com"
+//   - "*.example.com:443" matches subdomains of example.com on port 443
+func matchesPattern(pattern, host, port string) bool {
+	// Parse pattern into host and port parts
+	var patternHost, patternPort string
+
+	// Check if pattern contains a port
+	if idx := lastIndexByte(pattern, ':'); idx >= 0 {
+		// Pattern has a port
+		patternHost = pattern[:idx]
+		patternPort = pattern[idx+1:]
+	} else {
+		// Pattern has no port - match any port
+		patternHost = pattern
+		patternPort = ""
+	}
+
+	// If pattern specifies a port, it must match exactly
+	if patternPort != "" && patternPort != port {
+		return false
+	}
+
+	// Check host matching (with wildcard support)
+	return matchesHost(patternHost, host)
+}
+
+// matchesHost checks if a host matches a pattern with wildcard support.
+// Wildcards (*) only match at the beginning:
+//   - "*.example.com" matches "api.example.com" and "foo.bar.example.com"
+//   - "*.example.com" does NOT match "example.com" itself
+func matchesHost(pattern, host string) bool {
+	// Exact match
+	if pattern == host {
+		return true
+	}
+
+	// Wildcard match
+	if len(pattern) > 2 && pattern[0] == '*' && pattern[1] == '.' {
+		// Pattern is "*.suffix"
+		suffix := pattern[1:] // ".suffix"
+
+		// Host must end with the suffix and have at least one character before it
+		if len(host) > len(suffix) && hasSuffix(host, suffix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// lastIndexByte finds the last occurrence of byte c in string s.
+// Returns -1 if not found.
+func lastIndexByte(s string, c byte) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// hasSuffix checks if string s ends with suffix.
+func hasSuffix(s, suffix string) bool {
+	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }
 
 // handleSOCKS processes a SOCKS5 connection.
