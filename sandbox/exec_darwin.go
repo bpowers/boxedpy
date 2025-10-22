@@ -4,12 +4,14 @@ package sandbox
 
 import (
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 )
 
 //go:embed seatbelt_base_policy.sbpl
@@ -152,9 +154,15 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 		tmpDir = canonTmpDir
 	}
 
+	// Generate unique log tag for violation tracking
+	logTag := fmt.Sprintf("boxedpy-%d-%s", time.Now().Unix(), randomString(8))
+
+	// Inject log tag into base policy
+	fullPolicy := strings.ReplaceAll(seatbeltBasePolicy, "boxedpy-LOGTAG", logTag)
+
 	// Build Seatbelt policy string
 	var policyBuilder strings.Builder
-	policyBuilder.WriteString(seatbeltBasePolicy)
+	policyBuilder.WriteString(fullPolicy)
 	policyBuilder.WriteString("\n")
 
 	// Add read access rules (restricted to explicitly mounted paths)
@@ -163,7 +171,7 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 		for i := range readablePaths {
 			policyBuilder.WriteString(fmt.Sprintf("  (subpath (param \"READABLE_ROOT_%d\"))\n", i))
 		}
-		policyBuilder.WriteString(")\n")
+		policyBuilder.WriteString(fmt.Sprintf("  (with message \"%s-read\"))\n", logTag))
 	}
 
 	// Add write access rules
@@ -172,7 +180,7 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 		for i := range writablePaths {
 			policyBuilder.WriteString(fmt.Sprintf("  (subpath (param \"WRITABLE_ROOT_%d\"))\n", i))
 		}
-		policyBuilder.WriteString(")\n")
+		policyBuilder.WriteString(fmt.Sprintf("  (with message \"%s-write\"))\n", logTag))
 	}
 
 	// Add network access rules based on policy
@@ -192,7 +200,7 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 	}
 	// If both are false, no network rules are added (network is blocked)
 
-	fullPolicy := policyBuilder.String()
+	fullPolicy = policyBuilder.String()
 
 	// Build command-line arguments
 	args := []string{seatbeltPath, "-p", fullPolicy}
@@ -212,4 +220,19 @@ func seatbeltArgs(policy *Policy, name string, argv, envv []string) ([]string, s
 	args = append(args, argv...)
 
 	return args, tmpDir, workdir, nil
+}
+
+// randomString generates a random alphanumeric string of length n.
+// Used for generating unique log tags for sandbox violation tracking.
+func randomString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based suffix if crypto/rand fails
+		return fmt.Sprintf("%d", time.Now().UnixNano()%100000000)
+	}
+	for i := range b {
+		b[i] = letters[int(b[i])%len(letters)]
+	}
+	return string(b)
 }
