@@ -1,6 +1,10 @@
 package sandbox
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"runtime"
 	"strings"
 	"testing"
@@ -70,4 +74,72 @@ func TestNetworkProxy_MultipleInstances(t *testing.T) {
 	// Addresses should be different
 	assert.NotEqual(t, proxy1.HTTPAddr(), proxy2.HTTPAddr())
 	assert.NotEqual(t, proxy1.SOCKSAddr(), proxy2.SOCKSAddr())
+}
+
+func TestNetworkProxy_HTTPConnect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+
+	// Only test on macOS for now (TCP sockets are easier to test)
+	if runtime.GOOS != "darwin" {
+		t.Skip("TCP proxy test only runs on macOS")
+	}
+
+	t.Parallel()
+
+	// Create a test HTTP server
+	testServer := &testHTTPServer{}
+	testServer.Start(t)
+	defer testServer.Stop()
+
+	// Create proxy with no filter (allow all)
+	proxy, err := NewNetworkProxy(nil)
+	require.NoError(t, err)
+	defer proxy.Close()
+
+	// Extract proxy URL (should be http://127.0.0.1:PORT on macOS)
+	proxyURL, err := url.Parse(proxy.HTTPAddr())
+	require.NoError(t, err)
+
+	// Create HTTP client with proxy
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	// Make an HTTP request through the proxy
+	resp, err := client.Get(testServer.URL + "/test")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, 200, resp.StatusCode)
+
+	// Verify we can read the response body
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "test response")
+}
+
+// Test helpers
+
+// testHTTPServer is a simple HTTP server for testing proxy functionality.
+type testHTTPServer struct {
+	server *httptest.Server
+	URL    string
+}
+
+func (s *testHTTPServer) Start(t *testing.T) {
+	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("test response from " + r.URL.Path))
+	}))
+	s.URL = s.server.URL
+}
+
+func (s *testHTTPServer) Stop() {
+	if s.server != nil {
+		s.server.Close()
+	}
 }

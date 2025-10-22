@@ -236,8 +236,157 @@ func (p *NetworkProxy) serveSOCKS(ctx context.Context) error {
 
 // handleHTTPRequest processes HTTP proxy requests (GET, POST, CONNECT, etc.).
 func (p *NetworkProxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
-	// Placeholder - will be implemented in Phase 2
-	http.Error(w, "not implemented", http.StatusNotImplemented)
+	if r.Method == http.MethodConnect {
+		p.handleConnect(w, r)
+		return
+	}
+
+	// For non-CONNECT requests (regular HTTP proxy), we use a reverse proxy approach
+	// This handles GET, POST, etc. requests properly
+	host := r.URL.Host
+	if host == "" {
+		host = r.Host
+	}
+
+	if host == "" {
+		http.Error(w, "Bad Request: missing host", http.StatusBadRequest)
+		return
+	}
+
+	// Extract host and port
+	hostname, port, err := net.SplitHostPort(host)
+	if err != nil {
+		// No port specified, assume default based on scheme
+		hostname = host
+		if r.URL.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	// Check filter
+	if !p.isAllowed(hostname, port) {
+		http.Error(w, "Forbidden: destination not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Create HTTP client to forward the request
+	targetURL := r.URL
+	if targetURL.Scheme == "" {
+		targetURL.Scheme = "http"
+	}
+
+	// Create a new request to the target
+	proxyReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Copy headers
+	for key, values := range r.Header {
+		for _, value := range values {
+			proxyReq.Header.Add(key, value)
+		}
+	}
+
+	// Make the request
+	client := &http.Client{}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+
+	// Write status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy response body
+	io.Copy(w, resp.Body)
+}
+
+// handleConnect handles HTTP CONNECT requests for HTTPS tunneling.
+func (p *NetworkProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	// Extract target host:port from request
+	targetAddr := r.Host
+	if targetAddr == "" {
+		targetAddr = r.URL.Host
+	}
+
+	if targetAddr == "" {
+		http.Error(w, "Bad Request: missing host", http.StatusBadRequest)
+		return
+	}
+
+	// Parse host and port
+	host, port, err := net.SplitHostPort(targetAddr)
+	if err != nil {
+		// CONNECT requires explicit port
+		http.Error(w, "Bad Request: invalid host:port", http.StatusBadRequest)
+		return
+	}
+
+	// Check filter
+	if !p.isAllowed(host, port) {
+		http.Error(w, "Forbidden: destination not allowed", http.StatusForbidden)
+		return
+	}
+
+	// Dial target
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		http.Error(w, "Bad Gateway: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer targetConn.Close()
+
+	// Hijack the connection to get raw TCP access
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Internal Server Error: hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		http.Error(w, "Internal Server Error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	// Send success response to client
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	if err != nil {
+		return
+	}
+
+	// Start bidirectional copy
+	bidirectionalCopy(targetConn, clientConn)
+}
+
+// isAllowed checks if a connection to the given host and port is allowed by the filter.
+func (p *NetworkProxy) isAllowed(host, port string) bool {
+	if p.filter == nil {
+		return true
+	}
+
+	// Placeholder - full implementation in Phase 4
+	// For now, allow everything if filter is set but empty
+	if len(p.filter.AllowHosts) == 0 && len(p.filter.DenyHosts) == 0 {
+		return true
+	}
+
+	// Temporary: allow all if filter exists (will be properly implemented in Phase 4)
+	return true
 }
 
 // handleSOCKS processes a SOCKS5 connection.
