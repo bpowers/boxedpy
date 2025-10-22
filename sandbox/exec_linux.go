@@ -40,6 +40,11 @@ func (p *Policy) commandContext(ctx context.Context, name string, arg ...string)
 	cmd := exec.CommandContext(ctx, bwrapPath, bwrapArgs[1:]...)
 	cmd.Env = envv
 
+	// If network proxy is configured, add proxy environment variables
+	if p.NetworkProxy != nil {
+		cmd.Env = append(cmd.Env, p.NetworkProxy.Env()...)
+	}
+
 	return cmd, nil
 }
 
@@ -96,6 +101,27 @@ func bubblewrapArgs(policy *Policy, name string, argv, envv []string) ([]string,
 		}
 	}
 
+	// Mount Unix sockets for network proxy (if configured)
+	if policy.NetworkProxy != nil {
+		// Extract Unix socket paths from proxy addresses
+		httpSock := extractUnixSocketPath(policy.NetworkProxy.HTTPAddr())
+		socksSock := extractUnixSocketPath(policy.NetworkProxy.SOCKSAddr())
+
+		// Mount sockets into sandbox (read-write for bidirectional communication)
+		if httpSock != "" {
+			args, err = appendMount(args, seen, mount{flag: "--bind", source: httpSock, target: httpSock})
+			if err != nil {
+				return nil, fmt.Errorf("mount http proxy socket: %w", err)
+			}
+		}
+		if socksSock != "" {
+			args, err = appendMount(args, seen, mount{flag: "--bind", source: socksSock, target: socksSock})
+			if err != nil {
+				return nil, fmt.Errorf("mount socks proxy socket: %w", err)
+			}
+		}
+	}
+
 	// Essential virtual filesystems (always required for process execution)
 	args = append(args,
 		"--proc", "/proc",
@@ -128,6 +154,9 @@ func bubblewrapArgs(policy *Policy, name string, argv, envv []string) ([]string,
 	if !policy.AllowSharedNamespaces {
 		// Unshare all namespaces (network, IPC, PID, UTS, cgroup)
 		args = append(args, "--unshare-all")
+	} else if policy.NetworkProxy != nil {
+		// Proxy-based filtering: remove network namespace for full isolation
+		args = append(args, "--unshare-net")
 	} else if !policy.AllowNetwork {
 		// Shared namespaces allowed, but network specifically blocked
 		args = append(args, "--unshare-net")
@@ -188,4 +217,15 @@ func ensurePath(path string) error {
 		return err
 	}
 	return nil
+}
+
+// extractUnixSocketPath extracts the filesystem path from a Unix socket address.
+// For addresses like "unix:///tmp/boxedpy-NNNN/http.sock", returns "/tmp/boxedpy-NNNN/http.sock".
+// For non-Unix socket addresses, returns empty string.
+func extractUnixSocketPath(addr string) string {
+	const prefix = "unix://"
+	if len(addr) > len(prefix) && addr[:len(prefix)] == prefix {
+		return addr[len(prefix):]
+	}
+	return ""
 }
